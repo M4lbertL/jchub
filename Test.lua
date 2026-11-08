@@ -1,9 +1,9 @@
--- OFFLINE LOADER: complete dashboard included below; execute this entire file.
--- JcHub Restaurant Dashboard v1.0.0
+-- OFFLINE LOADER v1.1.0: execute this entire self-contained file.
+-- JcHub Restaurant Dashboard v1.1.0
 -- Self-contained offline entry point. No downloads, purchases or remote requests.
 -- Run on the client in EquipmentTesting (PlaceId 110767861733691).
 
-local VERSION = "1.0.0"
+local VERSION = "1.1.0"
 local EXPECTED_PLACE = 110767861733691
 local Players = game:GetService("Players")
 local Workspace = game:GetService("Workspace")
@@ -79,6 +79,7 @@ local rarityColors = {
     Legendary = Color3.fromRGB(255, 202, 102), Mythic = Color3.fromRGB(255, 133, 166),
 }
 local connections, running = {}, true
+local pageConnections, targetHighlight, alertSound = {}, nil, nil
 local function connect(signal, fn)
     local c = signal:Connect(fn); table.insert(connections, c); return c
 end
@@ -116,6 +117,9 @@ local function cleanup()
     running = false
     for _, c in ipairs(connections) do c:Disconnect() end
     table.clear(connections)
+    for _, c in ipairs(pageConnections) do c:Disconnect() end
+    table.clear(pageConnections)
+    if targetHighlight then targetHighlight:Destroy(); targetHighlight = nil end
 end
 connect(gui.Destroying, cleanup)
 local main = make("Frame", {Name = "Window", BackgroundColor3 = colors.background,
@@ -136,7 +140,8 @@ local minimize = button(header, "—", UDim2.fromOffset(34, 30), UDim2.new(1, -8
 local close = button(header, "×", UDim2.fromOffset(34, 30), UDim2.new(1, -46, 0, 16))
 local body = make("Frame", {BackgroundTransparency = 1, Position = UDim2.fromOffset(12, 76),
     Size = UDim2.new(1, -24, 1, -110)}, main)
-local sidebar = make("Frame", {BackgroundColor3 = colors.sidebar, BorderSizePixel = 0,
+local sidebar = make("ScrollingFrame", {BackgroundColor3 = colors.sidebar, BorderSizePixel = 0,
+    ScrollBarThickness = 2, CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y,
     Size = UDim2.new(0, 132, 1, 0)}, body)
 corner(sidebar)
 make("UIPadding", {PaddingTop = UDim.new(0, 10), PaddingLeft = UDim.new(0, 8),
@@ -325,16 +330,39 @@ end
 
 local selectedTab, tabButtons, render = "Overview", {}, nil
 local lastSignature, lastState, lastPlot
+local viewRows = {}
 local function card(title, lines, titleColor)
-    local frame = make("Frame", {BackgroundColor3 = colors.card, BorderSizePixel = 0,
-        Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y}, content)
-    corner(frame)
-    make("UIPadding", {PaddingTop = UDim.new(0, 13), PaddingBottom = UDim.new(0, 13),
-        PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14)}, frame)
-    make("UIListLayout", {Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder}, frame)
-    local titleLabel = label(frame, title, 15, titleColor or colors.text); titleLabel.Font = Enum.Font.GothamBold
-    titleLabel.LayoutOrder = 0
-    for index, line in ipairs(lines) do local l = label(frame, line, 13, colors.muted); l.LayoutOrder = index end
+    local row = {title = title, lines = lines, color = titleColor or colors.text, actions = {}}
+    table.insert(viewRows, row)
+    return row
+end
+local function action(row, caption, callback, identity)
+    table.insert(row.actions, {caption = caption, callback = callback, identity = identity})
+end
+local function drawRows(resetScroll)
+    local scroll = content.CanvasPosition
+    for _, c in ipairs(pageConnections) do c:Disconnect() end
+    table.clear(pageConnections)
+    for _, child in ipairs(content:GetChildren()) do if child:IsA("Frame") then child:Destroy() end end
+    for index, row in ipairs(viewRows) do
+        local frame = make("Frame", {BackgroundColor3 = colors.card, BorderSizePixel = 0,
+            LayoutOrder = index, Size = UDim2.new(1, 0, 0, 0), AutomaticSize = Enum.AutomaticSize.Y}, content)
+        corner(frame)
+        make("UIPadding", {PaddingTop = UDim.new(0, 13), PaddingBottom = UDim.new(0, 13),
+            PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14)}, frame)
+        make("UIListLayout", {Padding = UDim.new(0, 7), SortOrder = Enum.SortOrder.LayoutOrder}, frame)
+        local titleLabel = label(frame, row.title, 15, row.color); titleLabel.Font = Enum.Font.GothamBold
+        titleLabel.LayoutOrder = 0
+        for lineIndex, line in ipairs(row.lines) do
+            local l = label(frame, line, 13, colors.muted); l.LayoutOrder = lineIndex
+        end
+        for actionIndex, item in ipairs(row.actions) do
+            local b = button(frame, item.caption, UDim2.new(1, 0, 0, 32))
+            b.LayoutOrder = #row.lines + actionIndex
+            table.insert(pageConnections, b.Activated:Connect(item.callback))
+        end
+    end
+    content.CanvasPosition = resetScroll and Vector2.zero or scroll
 end
 local function shortId(object, key)
     local value = attr(object, key or "FurnitureInstanceId")
@@ -345,6 +373,306 @@ local function plotRequired(state)
     card("Waiting for your restaurant", {state.reason, "Claim a restaurant, then keep the dashboard open. It refreshes automatically."}, colors.warning)
     return false
 end
+local settings = {lowStock = 5, condition = 25, refresh = 2, sounds = false}
+local Features = {cleaningType = "All", autoNearest = false, history = {}, previous = {},
+    activeAlerts = {}, baselinePlot = nil, historyLimit = 200, lastSound = -math.huge}
+local objectIds, nextObjectId = setmetatable({}, {__mode = "k"}), 0
+function Features.id(object)
+    if not objectIds[object] then nextObjectId += 1; objectIds[object] = nextObjectId end
+    return tostring(objectIds[object])
+end
+function Features.refreshView()
+    lastSignature = nil
+    if Features.refresh then Features.refresh() end
+end
+function Features.log(kind, text, plot)
+    table.insert(Features.history, 1, {time = os.date("%H:%M:%S"), kind = kind, text = text,
+        plot = plot and Core.text(attr(plot, "PlotId")) or "No plot"})
+    if #Features.history > Features.historyLimit then table.remove(Features.history) end
+end
+function Features.recipeTotals(slots)
+    local groups = {}
+    for _, slot in ipairs(slots) do
+        local name = Core.text(slot.recipe, "Unknown recipe")
+        local group = groups[name]
+        if not group then
+            group = {name = name, quantity = 0, reserved = 0, slots = 0, known = 0, reservationsKnown = 0}
+            groups[name] = group
+        end
+        group.slots += 1
+        local q, r = Core.number(slot.quantity), Core.number(slot.reserved)
+        if q then group.quantity += q; group.known += 1 end
+        if r then group.reserved += r; group.reservationsKnown += 1 end
+    end
+    local result = {}
+    for _, group in pairs(groups) do table.insert(result, group) end
+    table.sort(result, function(a,b) return a.name < b.name end)
+    return result
+end
+function Features.assignments(state)
+    local issues, claimed, loaded = {}, {}, {}
+    for _, station in ipairs(state.equipment) do
+        local id = attr(station, "FurnitureInstanceId")
+        if id then loaded[tostring(id)] = station end
+    end
+    for _, worker in ipairs(state.workers) do
+        local id = Features.id(worker)
+        local function issue(key, text) table.insert(issues, {key = key .. id, text = nameOf(worker) .. ": " .. text, target = worker}) end
+        local cook = attr(worker, "Role") == "Cook"
+        if cook and (attr(worker, "RecipeId") == nil or attr(worker, "RecipeId") == "") then
+            issue("recipe", "no recipe assignment reported")
+        end
+        for _, assignment in ipairs({{"StoveInstanceId", "stove"}, {"PrepTableInstanceId", "prep table"}}) do
+            local stationId = attr(worker, assignment[1])
+            if cook and (stationId == nil or stationId == "") then
+                issue(assignment[1], "no " .. assignment[2] .. " assignment reported")
+            elseif stationId ~= nil and stationId ~= "" then
+                stationId = tostring(stationId)
+                local key = assignment[1] .. ":" .. stationId
+                if not claimed[key] then claimed[key] = {} end
+                table.insert(claimed[key], worker)
+                if not loaded[stationId] then issue("unloaded" .. assignment[1], "assigned " .. assignment[2] .. " is not loaded; assignment cannot be verified") end
+            end
+        end
+    end
+    for key, group in pairs(claimed) do
+        if #group > 1 then
+            local names = {}
+            for _, worker in ipairs(group) do table.insert(names, nameOf(worker)) end
+            table.sort(names)
+            table.insert(issues, {key = "conflict:" .. key, text = "Shared station assignment: " .. table.concat(names, ", ") .. " (" .. key .. ")"})
+        end
+    end
+    table.sort(issues, function(a,b) return a.key < b.key end)
+    return issues
+end
+function Features.alerts(state)
+    local result = {}
+    if not state.plot then return result end
+    local function add(key, title, detail, target)
+        table.insert(result, {key = key, title = title, detail = detail, target = target})
+    end
+    for _, slot in ipairs(state.slots) do
+        local q = Core.number(slot.quantity)
+        if q and q <= settings.lowStock then
+            add("stock:" .. Features.id(slot.instance), "Low stock · " .. Core.text(slot.recipe),
+                Core.count(q) .. " recorded servings (warning at " .. settings.lowStock .. ")")
+        end
+    end
+    for _, station in ipairs(state.equipment) do
+        local condition = Core.number(attr(station, "Condition"))
+        if condition and condition <= settings.condition then
+            add("condition:" .. Features.id(station), "Low condition · " .. station.Name,
+                "Condition " .. Core.count(condition) .. " (warning at " .. settings.condition .. ")", station)
+        end
+    end
+    for _, worker in ipairs(state.workers) do
+        local status = attr(worker, "WorkerStatus")
+        if attr(worker, "IsOnDuty") == false or status == "OffDuty" then
+            add("offduty:" .. Features.id(worker), "Off duty · " .. nameOf(worker), "Reported status: " .. Core.text(status))
+        end
+        if status == "MissingRecipe" then
+            add("missingrecipe:" .. Features.id(worker), "Missing recipe · " .. nameOf(worker), "The game reports MissingRecipe.")
+        end
+    end
+    for _, issue in ipairs(state.assignmentIssues) do add("assignment:" .. issue.key, "Assignment check", issue.text) end
+    table.sort(result, function(a,b) return a.key < b.key end)
+    return result
+end
+function Features.playSound()
+    if not alertSound then
+        alertSound = make("Sound", {Name = "JcHubAlertSound", SoundId = "rbxasset://sounds/electronicpingshort.wav", Volume = 0.35}, gui)
+    end
+    pcall(function() alertSound:Play() end)
+end
+function Features.snapshot(state)
+    local result = {}
+    local function field(key, kind, title, value)
+        if value ~= nil then result[key] = {kind = kind, title = title, value = value} end
+    end
+    for _, slot in ipairs(state.slots) do
+        -- A new recipe/display identity starts a new baseline rather than faking a sale.
+        local key = "stock:" .. Features.id(slot.instance) .. ":" .. Core.text(attr(slot.instance, "DisplayId")) .. ":" .. Core.text(slot.recipe)
+        field(key, "Stock", Core.text(slot.recipe) .. " · " .. shortId(slot.instance, "DisplayId"), Core.number(slot.quantity))
+    end
+    for _, station in ipairs(state.equipment) do
+        field("condition:" .. Features.id(station), "Condition", station.Name .. " · " .. shortId(station), Core.number(attr(station, "Condition")))
+    end
+    for _, worker in ipairs(state.workers) do
+        local key = Features.id(worker)
+        field("status:" .. key, "Worker", nameOf(worker) .. " · " .. shortId(worker, "WorkerId") .. " status", attr(worker, "WorkerStatus"))
+        field("duty:" .. key, "Worker", nameOf(worker) .. " · " .. shortId(worker, "WorkerId") .. " on duty", attr(worker, "IsOnDuty"))
+    end
+    return result
+end
+function Features.observe(state)
+    state.assignmentIssues = Features.assignments(state)
+    state.alerts = Features.alerts(state)
+    local snapshot, plotChanged = Features.snapshot(state), state.plot ~= Features.baselinePlot
+    if plotChanged then
+        if state.plot then Features.log("Monitoring", "New plot baseline started; no earlier activity inferred.", state.plot)
+        elseif Features.baselinePlot then Features.log("Monitoring", "Plot unavailable or ownership ambiguous; monitoring paused.", Features.baselinePlot) end
+        Features.baselinePlot = state.plot
+        Features.activeAlerts = {}
+    elseif state.plot then
+        for key, item in pairs(snapshot) do
+            local before = Features.previous[key]
+            if before and before.value ~= item.value then
+                Features.log(item.kind, item.title .. ": " .. Core.text(before.value) .. " → " .. Core.text(item.value), state.plot)
+            end
+        end
+    end
+    Features.previous = snapshot
+    local active, fresh = {}, false
+    for _, item in ipairs(state.alerts) do
+        active[item.key] = true
+        if not Features.activeAlerts[item.key] then fresh = true end
+    end
+    if fresh and not plotChanged and settings.sounds and os.clock() - Features.lastSound >= 10 then
+        Features.lastSound = os.clock(); Features.playSound()
+    end
+    Features.activeAlerts = active
+end
+function Features.clearTarget()
+    Features.target, Features.targetPlot = nil, nil
+    if targetHighlight then targetHighlight:Destroy(); targetHighlight = nil end
+end
+function Features.validTarget(object, state)
+    if not object or not state.plot or not object:IsDescendantOf(state.plot) or not ownerMatches(object, state.plot) then return false end
+    if attr(state.plot, "Claimed") ~= true or tonumber(attr(state.plot, "OwnerUserId")) ~= player.UserId then return false end
+    for _, list in ipairs({state.equipment, state.displays, state.garbage}) do
+        for _, item in ipairs(list) do if object == item then return true end end
+    end
+    return false
+end
+function Features.setTarget(object, state)
+    if not Features.validTarget(object, state) or (not object:IsA("Model") and not object:IsA("BasePart")) then
+        Features.clearTarget(); return false
+    end
+    if Features.target == object and targetHighlight then return true end
+    Features.clearTarget()
+    Features.target, Features.targetPlot = object, state.plot
+    targetHighlight = make("Highlight", {Name = "JcHubRestaurantTarget", Adornee = object,
+        FillColor = colors.accent, OutlineColor = colors.accent, FillTransparency = 0.65,
+        OutlineTransparency = 0, DepthMode = Enum.HighlightDepthMode.Occluded}, Workspace)
+    return true
+end
+function Features.nearest(state)
+    if not state.playerPosition then return nil end
+    for _, object in ipairs(state.garbage) do
+        if (Features.cleaningType == "All" or attr(object, "GarbageType") == Features.cleaningType) and position(object) then return object end
+    end
+    return nil
+end
+function Features.updateTarget(state)
+    if Features.autoNearest then
+        local nearest = Features.nearest(state)
+        if nearest then Features.setTarget(nearest, state) else Features.clearTarget() end
+    elseif Features.target and (Features.targetPlot ~= state.plot or not Features.validTarget(Features.target, state)) then
+        Features.clearTarget()
+    end
+end
+function Features.locate(object, mode)
+    -- Re-resolve on every click; a stale card cannot select a different owner's object.
+    local state = collect()
+    Features.autoNearest = false
+    Features.setTarget(object, state)
+    Features.refreshView()
+end
+function Features.targetCard(state)
+    local object = Features.target
+    if not object then return end
+    local distance = Core.distance(state.playerPosition, position(object))
+    local row = card("Located · " .. object.Name, {"Distance: " .. (distance and string.format("%.1f studs", distance) or "Unknown"),
+        "A mint highlight marks this object when visible. Your character and camera stay under your control."}, colors.accent)
+    action(row, "Clear highlight", function() Features.autoNearest = false; Features.clearTarget(); Features.refreshView() end)
+end
+function Features.recipeCards(state)
+    card("Recipe totals", {"Combined across your loaded displays. Recorded quantities and reservations remain separate."}, colors.accent)
+    for _, group in ipairs(Features.recipeTotals(state.slots)) do
+        card(group.name, {"Recorded servings: " .. (group.known > 0 and Core.count(group.quantity) or "Unknown") .. " across " .. group.slots .. " slots",
+            "Reservations: " .. (group.reservationsKnown > 0 and Core.count(group.reserved) or "Unknown")
+                .. "  •  " .. group.reservationsKnown .. "/" .. group.slots .. " slots reported reservations"})
+    end
+end
+function Features.assignmentCards(state)
+    local lines = {}
+    for _, issue in ipairs(state.assignmentIssues) do table.insert(lines, issue.text) end
+    if #lines == 0 then table.insert(lines, "No assignment issues detected in the loaded data.") end
+    table.insert(lines, "Unloaded stations are not proof of a broken assignment. Non-cook roles do not require a recipe here.")
+    card("Assignment checker", lines, #state.assignmentIssues > 0 and colors.warning or colors.accent)
+end
+function Features.cleaningControls(state)
+    Features.targetCard(state)
+    local groups, types = {}, {"All"}
+    for _, object in ipairs(state.garbage) do
+        local kind = Core.text(attr(object, "GarbageType")); groups[kind] = (groups[kind] or 0) + 1
+    end
+    for kind in pairs(groups) do table.insert(types, kind) end
+    table.sort(types, function(a,b) if a == b then return false elseif a == "All" then return true elseif b == "All" then return false end; return a < b end)
+    local lines = {"Filter: " .. Features.cleaningType .. "  •  Follow nearest: " .. (Features.autoNearest and "On" or "Off")}
+    for _, kind in ipairs(types) do if kind ~= "All" then table.insert(lines, kind .. ": " .. groups[kind]) end end
+    local row = card("Garbage groups", lines)
+    action(row, "Cycle garbage type", function()
+        local current = table.find(types, Features.cleaningType) or 1
+        Features.cleaningType = types[current % #types + 1]; Features.refreshView()
+    end)
+    action(row, "Highlight nearest matching garbage", function()
+        local current = collect(); local nearest = Features.nearest(current)
+        Features.autoNearest = false
+        if nearest then Features.setTarget(nearest, current) else Features.clearTarget() end
+        Features.refreshView()
+    end)
+    action(row, Features.autoNearest and "Stop following nearest" or "Follow nearest matching garbage", function()
+        Features.autoNearest = not Features.autoNearest
+        if not Features.autoNearest then Features.clearTarget() end
+        Features.refreshView()
+    end)
+end
+function Features.alertsTab(state)
+    if not plotRequired(state) then return end
+    card("Alerts center · " .. #state.alerts, {"Stock threshold: " .. settings.lowStock .. "  •  Condition threshold: " .. settings.condition,
+        "Sound: " .. (settings.sounds and "On" or "Off") .. "  •  Change these in Settings."}, colors.accent)
+    if #state.alerts == 0 then card("All clear", {"No current warnings were detected in your loaded restaurant data."}) end
+    for _, item in ipairs(state.alerts) do
+        local row = card(item.title, {item.detail}, colors.warning)
+        if item.target and table.find(state.equipment, item.target) then
+            action(row, "Locate equipment", function() Features.locate(item.target, "station") end, Features.id(item.target))
+        end
+    end
+end
+function Features.historyTab()
+    local row = card("Session history · " .. #Features.history, {"Observed stock, equipment condition, worker status and duty changes since launch.",
+        "Samples may miss activity between refreshes. A stock change does not prove a sale, and an object disappearing does not prove completion.",
+        "Most recent first. Up to " .. Features.historyLimit .. " entries are kept for this run, including while minimized."}, colors.accent)
+    action(row, "Clear session history", function() table.clear(Features.history); Features.refreshView() end)
+    if #Features.history == 0 then card("No changes recorded", {"Newly loaded objects establish a baseline before changes are recorded."}) end
+    for _, item in ipairs(Features.history) do card(item.time .. " · " .. item.kind .. " · " .. item.plot, {item.text}) end
+end
+function Features.adjust(key, delta)
+    local bounds = {lowStock = {0, 10000}, condition = {0, 100}, refresh = {1, 10}}
+    if bounds[key] then settings[key] = math.clamp(settings[key] + delta, bounds[key][1], bounds[key][2]) end
+    Features.refreshView()
+end
+function Features.settingsTab()
+    card("Dashboard settings", {"Changes apply immediately and last for this run. They reset when the dashboard is executed again."}, colors.accent)
+    for _, option in ipairs({{"lowStock", "Low-stock warning", 1, "servings"}, {"condition", "Low-condition warning", 5, "condition"},
+        {"refresh", "Refresh interval", 1, "seconds"}}) do
+        local key, title, step, unit = option[1], option[2], option[3], option[4]
+        local row = card(title .. " · " .. settings[key] .. " " .. unit, {key == "condition" and "Your warning threshold; the game's repair rules remain unknown." or "Adjust with the buttons below."})
+        action(row, "Decrease by " .. step, function() Features.adjust(key, -step) end)
+        action(row, "Increase by " .. step, function() Features.adjust(key, step) end)
+    end
+    local row = card("Alert sound · " .. (settings.sounds and "On" or "Off"), {"One sound for newly appearing alerts, at most once every 10 seconds. Initial plot warnings are silent."})
+    action(row, settings.sounds and "Turn sounds off" or "Turn sounds on", function() settings.sounds = not settings.sounds; Features.refreshView() end)
+    action(row, "Test alert sound", Features.playSound)
+    local reset = card("Defaults", {"Stock: 5  •  Condition: 25  •  Refresh: 2 seconds  •  Sound: Off"})
+    action(reset, "Reset settings", function()
+        settings.lowStock, settings.condition, settings.refresh, settings.sounds = 5, 25, 2, false
+        Features.refreshView()
+    end)
+end
+
 local function overview(state)
     if not plotRequired(state) then return end
     local plot = state.plot
@@ -355,6 +683,8 @@ local function overview(state)
             .. Core.count(attr(plot, "RestaurantWidthTiles")) .. " × " .. Core.count(attr(plot, "RestaurantDepthTiles")) .. " tiles",
     }, colors.accent)
     local quantity, _, known = Core.stockSummary(state.slots)
+    card("Alerts", {#state.alerts .. " current alerts. Open Alerts for details."}, #state.alerts > 0 and colors.warning or colors.accent)
+    Features.targetCard(state)
     card("At a glance", {
         "Workers: " .. #state.workers .. "  •  Stations: " .. #state.equipment .. "  •  Garbage: " .. #state.garbage,
         "Recorded servings: " .. (known > 0 and Core.count(quantity) or "Unknown") .. "  •  Displays: " .. #state.displays,
@@ -369,22 +699,25 @@ local function overview(state)
 end
 local function stock(state)
     if not plotRequired(state) then return end
+    Features.targetCard(state)
     local q, r, known, reservedKnown = Core.stockSummary(state.slots)
     card("Display stock", {"Recorded servings: " .. (known > 0 and Core.count(q) or "Unknown"),
         "Recorded reservations: " .. (reservedKnown > 0 and Core.count(r) or "Unknown"),
         "Reservations are shown separately. Available-to-sell stock is not inferred."}, colors.accent)
+    Features.recipeCards(state)
     for _, display in ipairs(state.displays) do
-        card(display.Name .. "  ·  " .. shortId(display), {
+        local displayCard = card(display.Name .. "  ·  " .. shortId(display), {
             "Occupied slots: " .. Core.count(attr(display, "DisplayedCount")) .. " / " .. Core.count(attr(display, "DisplayCapacity")),
             "Full: " .. Core.text(attr(display, "IsFull")) .. "  •  Layout: " .. Core.text(attr(display, "DisplayLayout")),
         })
+        action(displayCard, "Locate display", function() Features.locate(display, "station") end, Features.id(display))
     end
     for _, slot in ipairs(state.slots) do
-        local low = Core.number(slot.quantity) and slot.quantity <= 5
+        local low = Core.number(slot.quantity) and slot.quantity <= settings.lowStock
         card(Core.text(slot.recipe, Core.text(slot.assigned, "Unassigned slot")) .. "  ·  " .. shortId(slot.instance, "DisplayId"), {
             slot.instance.Parent.Parent.Name .. " / " .. slot.instance.Name,
             "Quantity: " .. Core.count(slot.quantity) .. "  •  Reserved: " .. Core.count(slot.reserved),
-            low and "Low stock: 5 or fewer recorded servings." or "Assigned recipe: " .. Core.text(slot.assigned),
+            low and "Low stock: " .. settings.lowStock .. " or fewer recorded servings." or "Assigned recipe: " .. Core.text(slot.assigned),
         }, low and colors.warning or nil)
     end
     if #state.displays == 0 then card("No displays loaded", {"Place a food display in your restaurant to see its stock here."}) end
@@ -392,6 +725,7 @@ local function stock(state)
 end
 local function workers(state)
     if plotRequired(state) then
+        Features.assignmentCards(state)
         card("Restaurant staff", {#state.workers .. " workers loaded. Assignments are shown as reported by the game."}, colors.accent)
         for _, worker in ipairs(state.workers) do
             local rarity = attr(worker, "Rarity")
@@ -415,12 +749,16 @@ local function cleaning(state)
     if not plotRequired(state) then return end
     card("Cleaning route", {#state.garbage .. " garbage objects in your restaurant, nearest first.",
         "Equip your broom and use the game's normal cleaning controls."}, colors.accent)
+    Features.cleaningControls(state)
     for _, garbage in ipairs(state.garbage) do
+        if Features.cleaningType == "All" or attr(garbage, "GarbageType") == Features.cleaningType then
         local distance = Core.distance(state.playerPosition, position(garbage))
-        card(Core.text(attr(garbage, "GarbageType")) .. "  ·  " .. garbage.Name, {
+        local garbageCard = card(Core.text(attr(garbage, "GarbageType")) .. "  ·  " .. garbage.Name, {
             "Distance: " .. (distance and string.format("%.1f studs", distance) or "Unknown"),
             "Clean progress: " .. Core.count(attr(garbage, "CleanProgress")),
         })
+        action(garbageCard, "Highlight this garbage", function() Features.locate(garbage, "garbage") end, Features.id(garbage))
+        end
     end
     local found = false
     for _, prompt in ipairs(state.prompts) do
@@ -438,14 +776,16 @@ local function cleaning(state)
 end
 local function equipment(state)
     if not plotRequired(state) then return end
-    card("Kitchen equipment", {"Condition at 25 or lower is highlighted as a dashboard warning; the game's repair threshold is unknown."}, colors.accent)
+    Features.targetCard(state)
+    card("Kitchen equipment", {"Condition at " .. settings.condition .. " or lower is highlighted. This is your warning threshold, not a verified game rule."}, colors.accent)
     for _, station in ipairs(state.equipment) do
         local condition = Core.number(attr(station, "Condition"))
-        card(station.Name .. "  ·  " .. shortId(station), {
+        local stationCard = card(station.Name .. "  ·  " .. shortId(station), {
             "Type: " .. Core.text(attr(station, "FurnitureType")) .. "  •  Equipment: " .. Core.text(attr(station, "EquipmentId")),
             "Condition: " .. Core.count(condition) .. "  •  Cooking: " .. Core.text(attr(station, "CookingState"), "Not reported"),
             "In use: " .. Core.text(attr(station, "InUse")) .. "  •  Occupied: " .. Core.text(attr(station, "Occupied")),
-        }, condition and condition <= 25 and colors.warning or nil)
+        }, condition and condition <= settings.condition and colors.warning or nil)
+        action(stationCard, "Locate station", function() Features.locate(station, "station") end, Features.id(station))
     end
     if #state.equipment == 0 then card("No stations loaded", {"Kitchen stations will appear when placed in your restaurant."}) end
 end
@@ -488,21 +828,27 @@ local function schedule()
     table.insert(rows, "Schedule above is copied from the game's display. Future outcomes are not predicted.")
     card("Game schedule", rows)
 end
-local renderers = {Overview = overview, Stock = stock, Workers = workers, Cleaning = cleaning, Equipment = equipment, Schedule = schedule}
-render = function(state, resetScroll)
-    local oldScroll = content.CanvasPosition
-    for _, child in ipairs(content:GetChildren()) do if child:IsA("Frame") then child:Destroy() end end
+local renderers = {Overview = overview, Stock = stock, Workers = workers, Cleaning = cleaning, Equipment = equipment, Schedule = schedule,
+    Alerts = Features.alertsTab, History = Features.historyTab, Settings = Features.settingsTab}
+local function buildRows(state)
+    viewRows = {}
     if game.PlaceId ~= EXPECTED_PLACE then
         card("Different game", {"This dashboard supports EquipmentTesting, place " .. EXPECTED_PLACE .. ".", "Restaurant data is not read in this game."}, colors.warning)
     else renderers[selectedTab](state) end
-    local order = 0
-    for _, child in ipairs(content:GetChildren()) do
-        if child:IsA("Frame") then order += 1; child.LayoutOrder = order end
+    local parts = {selectedTab, state.reason or ""}
+    for _, row in ipairs(viewRows) do
+        table.insert(parts, row.title); table.insert(parts, tostring(row.color))
+        for _, line in ipairs(row.lines) do table.insert(parts, line) end
+        for _, item in ipairs(row.actions) do table.insert(parts, item.caption); table.insert(parts, item.identity or "") end
     end
-    content.CanvasPosition = resetScroll and Vector2.zero or oldScroll
+    return table.concat(parts, "\n")
 end
-for index, name in ipairs({"Overview", "Stock", "Workers", "Cleaning", "Equipment", "Schedule"}) do
-    local tab = button(sidebar, name, UDim2.new(1, 0, 0, 42))
+render = function(state, resetScroll)
+    lastSignature = buildRows(state)
+    drawRows(resetScroll)
+end
+for index, name in ipairs({"Overview", "Alerts", "Stock", "Workers", "Cleaning", "Equipment", "Schedule", "History", "Settings"}) do
+    local tab = button(sidebar, name, UDim2.new(1, 0, 0, 35))
     tab.LayoutOrder = index; tabButtons[name] = tab
     connect(tab.Activated, function()
         selectedTab = name; lastSignature = nil
@@ -510,53 +856,56 @@ for index, name in ipairs({"Overview", "Stock", "Workers", "Cleaning", "Equipmen
             b.BackgroundColor3 = tabName == selectedTab and colors.selected or colors.card
             b.TextColor3 = tabName == selectedTab and colors.accent or colors.text
         end
-        if lastState then render(lastState, true) end
+        if Features.refresh then Features.refresh(true) end
     end)
 end
 tabButtons.Overview.BackgroundColor3 = colors.selected; tabButtons.Overview.TextColor3 = colors.accent
-local function update()
+local function update(resetScroll)
     if not running then return end
     if game.PlaceId ~= EXPECTED_PLACE then
+        Features.autoNearest = false; Features.clearTarget()
         lastState = {reason = "Different game"}; render(lastState, false)
         footer.Text = "v" .. VERSION .. "  •  Unsupported place"; return
     end
     local state = collect()
+    Features.observe(state)
+    Features.updateTarget(state)
     local changedPlot = state.plot ~= lastPlot
     lastPlot, lastState = state.plot, state
-    footer.Text = state.plot and ("v" .. VERSION .. "  •  " .. Core.text(attr(state.plot, "PlotId")) .. "  •  Owner verified  •  Read-only  •  Updated " .. os.date("%H:%M:%S"))
+    tabButtons.Alerts.Text = "Alerts (" .. #state.alerts .. ")"
+    footer.Text = state.plot and ("v" .. VERSION .. "  •  " .. Core.text(attr(state.plot, "PlotId")) .. "  •  Owner verified  •  " .. #state.alerts .. " alerts  •  " .. os.date("%H:%M:%S"))
         or ("v" .. VERSION .. "  •  " .. state.reason)
-    -- Rebuild only when visible text changes; stable scrolling while idle.
-    -- A detached frame collects the text signature before changing live cards.
-    local oldContent = content
-    local probe = make("Frame", {}, nil)
-    content = probe
-    local ok, err = pcall(function()
-        if game.PlaceId == EXPECTED_PLACE then renderers[selectedTab](state) end
-    end)
-    local parts = {selectedTab, state.reason}
-    if ok then
-        for _, object in ipairs(probe:GetDescendants()) do if object:IsA("TextLabel") then table.insert(parts, object.Text) end end
-    end
-    content = oldContent; probe:Destroy()
-    if not ok then error(err) end
-    local signature = table.concat(parts, "\n")
-    if signature ~= lastSignature or changedPlot then
-        lastSignature = signature; render(state, changedPlot)
+    if main.Visible then
+        local signature = buildRows(state)
+        if signature ~= lastSignature or changedPlot or resetScroll then
+            lastSignature = signature; drawRows(resetScroll or changedPlot)
+        end
     end
 end
-local function safeUpdate()
-    local ok, err = pcall(update)
+local function safeUpdate(resetScroll)
+    local ok, err = pcall(update, resetScroll)
     if not ok and running then
+        -- Never leave a highlight pointing at stale data after a failed sample.
+        Features.clearTarget()
         footer.Text = "v" .. VERSION .. "  •  Waiting for restaurant data; retrying…"
         warn("[JcHub Restaurant v" .. VERSION .. "] " .. tostring(err))
     end
 end
+Features.refresh = safeUpdate
 safeUpdate()
-local elapsed = 0
+local elapsed, targetElapsed = 0, 0
 connect(RunService.Heartbeat, function(delta)
-    elapsed += delta
-    if elapsed >= 2 then
-        elapsed = 0
-        if main.Visible then safeUpdate() end
+    elapsed += delta; targetElapsed += delta
+    -- Clear invalid ownership/removal promptly, even between full samples.
+    if targetElapsed >= 0.25 then
+        targetElapsed = 0
+        if Features.target and (not Features.targetPlot or not Features.target:IsDescendantOf(Features.targetPlot)
+            or tonumber(attr(Features.targetPlot, "OwnerUserId")) ~= player.UserId
+            or attr(Features.targetPlot, "Claimed") ~= true or not ownerMatches(Features.target, Features.targetPlot)) then
+            Features.clearTarget()
+        end
+    end
+    if elapsed >= settings.refresh then
+        elapsed = 0; safeUpdate()
     end
 end)
